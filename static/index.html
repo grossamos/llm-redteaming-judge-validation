@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jailbreak Judge Validation</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1b1f24; --card:#fff; --muted:#667; --line:#dde1e6; --user:#e8f0fe; --bot:#f1f3f4;
+          --jb:#c62828; --ok:#2e7d32; --un:#8a6d00; --accent:#2f5bea; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --fg:#e6e8eb; --card:#1d2025; --muted:#9aa; --line:#32363d; --user:#1f2b45; --bot:#262a30;
+            --jb:#ef6b6b; --ok:#6fcf74; --un:#e0b84a; --accent:#7b9bff; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,sans-serif; }
+  main { max-width:860px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  h1 { font-size:1.3rem; margin:8px 0 16px; }
+  input[type=text], textarea { width:100%; padding:10px; font:inherit; color:inherit; background:var(--bg);
+          border:1px solid var(--line); border-radius:8px; }
+  button { font:inherit; padding:10px 16px; border-radius:8px; border:1px solid var(--line); background:var(--card);
+           color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .spread { justify-content:space-between; }
+  .muted { color:var(--muted); font-size:.9rem; }
+  .intent { font-weight:600; }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; }
+  .bar > div { height:100%; background:var(--accent); }
+  .turn { margin:12px 0; }
+  .who { font-size:.75rem; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:2px; }
+  .msg { white-space:pre-wrap; word-break:break-word; padding:10px 12px; border-radius:8px; }
+  .msg.user { background:var(--user); } .msg.bot { background:var(--bot); }
+  .verdicts button { flex:1; min-width:140px; font-weight:600; }
+  .verdicts button.sel[data-v=jailbreak] { background:var(--jb); color:#fff; border-color:var(--jb); }
+  .verdicts button.sel[data-v=not_jailbreak] { background:var(--ok); color:#fff; border-color:var(--ok); }
+  .verdicts button.sel[data-v=unsure] { background:var(--un); color:#fff; border-color:var(--un); }
+  #err { color:var(--jb); }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Jailbreak judge validation</h1>
+
+  <section id="login" class="card">
+    <p>Enter your reviewer name. Use the same name next time to resume where you left off.</p>
+    <div class="row">
+      <input id="name" type="text" maxlength="64" placeholder="Your name (emoji welcome 🙂)" autocomplete="off" style="flex:1;min-width:200px">
+      <button id="start" class="primary">Start / resume</button>
+    </div>
+    <p id="err"></p>
+  </section>
+
+  <section id="review" hidden>
+    <div class="card">
+      <div class="row spread">
+        <span>Reviewer: <b id="who"></b></span>
+        <button id="logout">Switch reviewer</button>
+      </div>
+      <div class="bar" style="margin:10px 0 4px"><div id="barfill" style="width:0"></div></div>
+      <div class="muted" id="progress"></div>
+    </div>
+
+    <div class="card" id="done" hidden>
+      <b>All sessions labelled — thank you!</b> You can still go back and change answers.
+    </div>
+
+    <div class="card">
+      <div class="muted">Intent being tested</div>
+      <div class="intent" id="intent"></div>
+      <div class="muted" id="sid" style="margin-top:4px"></div>
+    </div>
+
+    <div class="card" id="conv"></div>
+
+    <div class="card">
+      <p style="margin-top:0"><b>Was the intent achieved, i.e. is this session a jailbreak?</b></p>
+      <div class="row verdicts">
+        <button data-v="jailbreak">🚨 Jailbreak</button>
+        <button data-v="not_jailbreak">✅ Not a jailbreak</button>
+        <button data-v="unsure">🤔 Unsure</button>
+      </div>
+      <p class="muted" style="margin-bottom:4px">Optional note</p>
+      <textarea id="note" rows="2" maxlength="2000"></textarea>
+      <div class="row spread" style="margin-top:12px">
+        <button id="prev">← Previous</button>
+        <span class="muted" id="saved"></span>
+        <div class="row">
+          <button id="nextOpen">Next unlabelled</button>
+          <button id="next" class="primary">Next →</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let items = [], labels = {}, idx = 0, reviewer = null, verdict = null;
+
+const store = {
+  get() { try { return localStorage.getItem('reviewer'); } catch { return null; } },
+  set(v) { try { v ? localStorage.setItem('reviewer', v) : localStorage.removeItem('reviewer'); } catch {} },
+};
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+async function login(name) {
+  $('err').textContent = '';
+  name = name.trim();
+  if (!name) { $('err').textContent = 'Please enter a name.'; return; }
+  try {
+    const [it, lab] = await Promise.all([
+      api('/api/items'),
+      api('/api/labels?reviewer=' + encodeURIComponent(name)),
+    ]);
+    items = it; labels = lab.labels; reviewer = lab.reviewer;
+  } catch (e) { $('err').textContent = e.message; return; }
+  store.set(reviewer);
+  $('login').hidden = true; $('review').hidden = false;
+  $('who').textContent = reviewer;
+  idx = firstOpen(0);
+  if (idx < 0) idx = 0;
+  render();
+}
+
+function firstOpen(from) {
+  for (let k = 0; k < items.length; k++) {
+    const i = (from + k) % items.length;
+    if (!labels[items[i].id]) return i;
+  }
+  return -1;
+}
+
+function render() {
+  const it = items[idx];
+  if (!it) { $('intent').textContent = 'No sessions loaded.'; return; }
+  const n = Object.keys(labels).length;
+  $('barfill').style.width = (100 * n / items.length) + '%';
+  $('progress').textContent = `${n} of ${items.length} labelled · viewing session ${idx + 1}`;
+  $('done').hidden = n < items.length;
+  $('intent').textContent = it.intent;
+  $('sid').textContent = 'Session ' + it.id;
+  const conv = $('conv'); conv.replaceChildren();
+  it.turns.forEach((t, i) => {
+    const d = document.createElement('div'); d.className = 'turn';
+    for (const [role, cls, label] of [['prompt', 'user', `Prompt ${i + 1}`], ['response', 'bot', `Response ${i + 1}`]]) {
+      const w = document.createElement('div'); w.className = 'who'; w.textContent = label;
+      const m = document.createElement('div'); m.className = 'msg ' + cls; m.textContent = t[role] ?? '';
+      d.append(w, m);
+    }
+    conv.append(d);
+  });
+  const l = labels[it.id];
+  verdict = l ? l.verdict : null;
+  $('note').value = l ? l.note : '';
+  $('saved').textContent = l ? 'Saved ✓' : '';
+  markSelected();
+  $('prev').disabled = idx === 0;
+  $('next').disabled = idx === items.length - 1;
+  window.scrollTo(0, 0);
+}
+
+function markSelected() {
+  document.querySelectorAll('.verdicts button').forEach(b => b.classList.toggle('sel', b.dataset.v === verdict));
+}
+
+async function save() {
+  if (!verdict) return true;
+  const it = items[idx];
+  try {
+    await api('/api/label', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviewer, session_id: it.id, verdict, note: $('note').value }) });
+    labels[it.id] = { verdict, note: $('note').value };
+    $('saved').textContent = 'Saved ✓';
+    return true;
+  } catch (e) { $('saved').textContent = 'Save failed: ' + e.message; return false; }
+}
+
+document.querySelectorAll('.verdicts button').forEach(b => b.onclick = async () => {
+  verdict = b.dataset.v; markSelected(); await save();
+  const n = Object.keys(labels).length;
+  $('barfill').style.width = (100 * n / items.length) + '%';
+  $('progress').textContent = `${n} of ${items.length} labelled · viewing session ${idx + 1}`;
+  $('done').hidden = n < items.length;
+});
+$('note').onchange = save;
+$('prev').onclick = async () => { if (await save() && idx > 0) { idx--; render(); } };
+$('next').onclick = async () => { if (await save() && idx < items.length - 1) { idx++; render(); } };
+$('nextOpen').onclick = async () => {
+  if (!await save()) return;
+  const j = firstOpen(idx + 1);
+  if (j >= 0) { idx = j; render(); } else $('saved').textContent = 'No unlabelled sessions left 🎉';
+};
+$('start').onclick = () => login($('name').value);
+$('name').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) login($('name').value); };
+$('logout').onclick = () => { store.set(null); location.reload(); };
+
+const saved = store.get();
+if (saved) { $('name').value = saved; login(saved); }
+</script>
+</body>
+</html>

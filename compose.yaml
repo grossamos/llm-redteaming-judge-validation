@@ -1,0 +1,25 @@
+services:
+  judge:
+    build: .
+    restart: unless-stopped
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
+    volumes:
+      - ./data.json:/app/data.json:ro,z
+      - results:/data
+    networks:
+      - proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.judge.rule=Host(`judge.amos.lu`)
+      - traefik.http.routers.judge.entrypoints=websecure
+      - traefik.http.routers.judge.tls.certresolver=le
+      - traefik.http.services.judge.loadbalancer.server.port=8000
+
+volumes:
+  results:
+
+networks:
+  proxy:
+    external: true
