@@ -5,22 +5,35 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Judge Validation Admin</title>
 <style>
-  :root { --bg:#f6f7f9; --fg:#1b1f24; --card:#fff; --muted:#667; --line:#dde1e6; --bad:#c62828; --accent:#2f5bea; }
+  :root { --bg:#f6f7f9; --fg:#1b1f24; --card:#fff; --muted:#667; --line:#dde1e6; --bad:#c62828; --accent:#2f5bea;
+          --good-bg:#d9f2dc; --bad-bg:#fbd9d9; --neu-bg:#e6e9ef; --jb:#b3261e; --ok:#1e7a2e; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#14161a; --fg:#e6e8eb; --card:#1d2025; --muted:#9aa; --line:#32363d; --bad:#ef6b6b; --accent:#7b9bff; }
+    :root { --bg:#14161a; --fg:#e6e8eb; --card:#1d2025; --muted:#9aa; --line:#32363d; --bad:#ef6b6b; --accent:#7b9bff;
+            --good-bg:#1f3d27; --bad-bg:#4a2323; --neu-bg:#2c3038; --jb:#ef6b6b; --ok:#6fcf74; }
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; }
-  main { max-width:1000px; margin:0 auto; padding:16px; }
+  main { max-width:1200px; margin:0 auto; padding:16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; overflow-x:auto; }
-  h1 { font-size:1.3rem; } h2 { font-size:1.05rem; margin-top:0; }
+  h1 { font-size:1.3rem; } h2 { font-size:1.05rem; margin:0 0 8px; }
   input, button { font:inherit; padding:8px 12px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:inherit; }
   button { cursor:pointer; } button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
   table { border-collapse:collapse; width:100%; }
   th, td { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { white-space:nowrap; }
   td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
-  .muted { color:var(--muted); } .bad { color:var(--bad); font-weight:600; }
-  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  td.c, th.c { text-align:center; }
+  .muted { color:var(--muted); font-size:.9rem; } .bad { color:var(--bad); font-weight:600; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; }
+  .stat { border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .stat .v { font-size:1.5rem; font-weight:650; font-variant-numeric:tabular-nums; }
+  .stat .l { color:var(--muted); font-size:.85rem; }
+  .agree { background:var(--good-bg); } .differ { background:var(--bad-bg); } .neutral { background:var(--neu-bg); }
+  .jb { color:var(--jb); font-weight:600; } .ok { color:var(--ok); font-weight:600; }
+  .judgecol { border-left:2px solid var(--accent); }
+  td.cell { text-align:center; white-space:nowrap; min-width:90px; }
+  td.intent { min-width:220px; max-width:360px; }
   [hidden] { display:none !important; }
 </style>
 </head>
@@ -38,20 +51,44 @@
   <div id="out" hidden>
     <div class="card">
       <div class="row">
-        <span id="totals" class="muted"></span>
         <button id="refresh">Refresh</button>
         <button id="csv">Download CSV</button>
-        <label class="muted"><input type="checkbox" id="onlyDis"> only disagreements</label>
+        <span id="totals" class="muted"></span>
       </div>
     </div>
-    <div class="card"><h2>Reviewers</h2><table id="rev"></table></div>
-    <div class="card"><h2>Sessions</h2><table id="ses"></table></div>
+
+    <div class="card"><h2>Overview</h2><div class="stats" id="stats"></div>
+      <p class="muted" style="margin-bottom:0">Cohen's κ corrects raw agreement for chance (1 = perfect, 0 = no better than chance, &lt;0 = worse).
+      Rough guide: &lt;0.2 poor, 0.2–0.4 fair, 0.4–0.6 moderate, 0.6–0.8 substantial, &gt;0.8 almost perfect.
+      Human majority = most common human label; ties are excluded. "Positive" = jailbreak.</p>
+    </div>
+
+    <div class="card"><h2>Agreement matrix <span class="muted">(Cohen's κ · % agree · n shared sessions)</span></h2><table id="pair"></table></div>
+
+    <div class="card"><h2>Reviewers vs judge</h2><table id="rev"></table></div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:8px">
+        <h2 style="margin:0">Attempts</h2>
+        <label class="muted"><input type="checkbox" id="fDis"> humans disagree</label>
+        <label class="muted"><input type="checkbox" id="fJudge"> judge ≠ human majority</label>
+        <label class="muted"><input type="checkbox" id="fMissing"> not yet fully reviewed</label>
+      </div>
+      <p class="muted" style="margin-top:0">Human cells are <span class="agree" style="padding:0 6px">green</span> when they match the judge and <span class="differ" style="padding:0 6px">red</span> when they don't. Hover the judge cell for its reasoning.</p>
+      <table id="ses"></table>
+    </div>
+
+    <div class="card"><h2>By intent</h2><table id="int"></table></div>
   </div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let token = '';
+let token = '', data = null;
 try { token = sessionStorage.getItem('tok') || ''; } catch {}
+
+const pct = x => x == null ? '–' : Math.round(x * 100) + '%';
+const kap = x => x == null ? '–' : x.toFixed(2);
+const lab = v => v === 'jailbreak' ? '🚨 JB' : v === 'not_jailbreak' ? '✅ OK' : '–';
 
 async function get(path) {
   const r = await fetch(path, { headers: { 'X-Admin-Token': token } });
@@ -59,27 +96,97 @@ async function get(path) {
   return r;
 }
 
+// cells: string | {v, cls, title}
 function fill(table, head, rows) {
   table.replaceChildren();
   const tr = table.insertRow();
-  head.forEach(([h, num]) => { const th = document.createElement('th'); th.textContent = h; if (num) th.className = 'n'; tr.append(th); });
+  head.forEach(h => { const th = document.createElement('th'); th.textContent = h.t ?? h; if (h.cls) th.className = h.cls; tr.append(th); });
   rows.forEach(r => {
     const tr = table.insertRow();
-    r.forEach((c, i) => { const td = tr.insertCell(); td.textContent = c.v ?? c; if (head[i][1]) td.className = 'n'; if (c.cls) td.classList.add(c.cls); });
+    r.forEach((c, i) => {
+      const td = tr.insertCell(); const o = (c && typeof c === 'object') ? c : { v: c };
+      td.textContent = o.v ?? '';
+      const hc = head[i].cls; if (hc) td.className = hc;
+      if (o.cls) o.cls.split(' ').forEach(k => td.classList.add(k));
+      if (o.title) td.title = o.title;
+    });
   });
+}
+
+function stat(v, l) {
+  const d = document.createElement('div'); d.className = 'stat';
+  const a = document.createElement('div'); a.className = 'v'; a.textContent = v;
+  const b = document.createElement('div'); b.className = 'l'; b.textContent = l;
+  d.append(a, b); return d;
+}
+
+function render() {
+  const s = data, jm = s.judge_vs_majority, hh = s.human_human;
+  $('totals').textContent = `${s.total_labels} labels · ${s.reviewers.length} reviewers · ${s.total_sessions} sessions (${s.sessions_with_judge} with judge verdict)`;
+
+  $('stats').replaceChildren(
+    stat(kap(jm.kappa), `κ judge vs human majority (n=${jm.n})`),
+    stat(pct(jm.agree), 'judge agrees with human majority'),
+    stat(pct(jm.precision), `judge precision (${jm.tp} TP, ${jm.fp} FP)`),
+    stat(pct(jm.recall), `judge recall (${jm.tp} TP, ${jm.fn} FN)`),
+    stat(kap(hh.mean_kappa), `mean κ between humans (${hh.pairs} pairs)`),
+    stat(pct(hh.mean_agree), 'mean human–human agreement'),
+    stat(`${s.sessions_with_split}`, 'sessions where humans split'),
+    stat(`${s.sessions_fully_covered}/${s.total_sessions}`, 'sessions reviewed by everyone'),
+  );
+
+  // pairwise matrix
+  const R = s.raters;
+  fill($('pair'), [{ t: '' }, ...R.map(r => ({ t: r, cls: 'c' }))],
+    R.map((a, i) => [{ v: a, cls: a === 'Judge' ? 'jb' : '' }, ...R.map((b, j) => {
+      if (i === j) return { v: '—', cls: 'neutral' };
+      const p = s.pair[i][j];
+      if (!p.n) return { v: '–', cls: 'neutral' };
+      const good = p.kappa == null ? p.agree >= 0.8 : p.kappa >= 0.6;
+      const bad = p.kappa == null ? p.agree < 0.5 : p.kappa < 0.2;
+      return { v: `${kap(p.kappa)} · ${pct(p.agree)} · ${p.n}`, cls: 'c ' + (good ? 'agree' : bad ? 'differ' : 'neutral') };
+    })]));
+
+  // reviewers
+  fill($('rev'), ['Reviewer', { t: 'Done', cls: 'n' }, { t: 'JB', cls: 'n' }, { t: 'OK', cls: 'n' }, { t: 'JB rate', cls: 'n' },
+      { t: 'Agree w/ judge', cls: 'n' }, { t: 'κ vs judge', cls: 'n' }, { t: 'Shared n', cls: 'n' }, 'Last active'],
+    s.reviewers.map(r => [r.name, { v: `${r.done}/${s.total_sessions}`, cls: 'n' }, { v: r.jailbreak, cls: 'n' }, { v: r.not_jailbreak, cls: 'n' },
+      { v: pct(r.done ? r.jailbreak / r.done : null), cls: 'n' }, { v: pct(r.judge_agree), cls: 'n' }, { v: kap(r.judge_kappa), cls: 'n' },
+      { v: r.judge_n, cls: 'n' }, new Date(r.last * 1000).toLocaleString()]));
+
+  // attempts table
+  const names = s.reviewers.map(r => r.name);
+  const rows = s.sessions.filter(x =>
+    (!$('fDis').checked || x.human_disagreement) &&
+    (!$('fJudge').checked || x.judge_differs) &&
+    (!$('fMissing').checked || Object.keys(x.votes).length < names.length));
+  fill($('ses'), ['Attempt', 'Intent', ...names.map((n, i) => ({ t: n, cls: 'c' })), { t: 'Judge', cls: 'c judgecol' },
+      { t: 'Human majority', cls: 'c' }, { t: 'Human agr.', cls: 'n' }],
+    rows.map(x => [
+      x.id,
+      { v: x.intent, cls: 'intent' },
+      ...names.map(n => {
+        const v = x.votes[n];
+        if (!v) return { v: '·', cls: 'cell neutral', title: 'not reviewed yet' };
+        return { v: lab(v), cls: 'cell ' + (!x.judge ? 'neutral' : v === x.judge ? 'agree' : 'differ') };
+      }),
+      { v: lab(x.judge), cls: 'cell judgecol neutral', title: x.judge_reason || '' },
+      { v: x.majority ? lab(x.majority) : (x.jailbreak + x.not_jailbreak ? 'tie' : '–'),
+        cls: 'cell ' + (!x.majority || !x.judge ? 'neutral' : x.majority === x.judge ? 'agree' : 'differ') },
+      { v: pct(x.human_agreement), cls: 'n' },
+    ]));
+
+  // intents
+  fill($('int'), ['Intent', { t: 'Sessions', cls: 'n' }, { t: 'Reviewed', cls: 'n' }, { t: 'Humans split', cls: 'n' }, { t: 'Judge = majority', cls: 'n' }],
+    s.intents.map(i => [i.intent, { v: i.sessions, cls: 'n' }, { v: i.labelled, cls: 'n' }, { v: i.human_split, cls: 'n' },
+      { v: i.judge_n ? `${i.judge_agree}/${i.judge_n} (${pct(i.judge_agree / i.judge_n)})` : '–', cls: 'n' }]));
 }
 
 async function load() {
   try {
-    const s = await (await get('/api/admin/summary')).json();
+    data = await (await get('/api/admin/summary')).json();
     $('auth').hidden = true; $('out').hidden = false;
-    $('totals').textContent = `${s.total_labels} labels · ${s.reviewers.length} reviewers · ${s.total_sessions} sessions`;
-    fill($('rev'), [['Reviewer'], ['Done', 1], ['Jailbreak', 1], ['Not', 1], ['Last active']],
-      s.reviewers.map(r => [r.name, `${r.done}/${s.total_sessions}`, r.jailbreak, r.not_jailbreak, new Date(r.last * 1000).toLocaleString()]));
-    const only = $('onlyDis').checked;
-    fill($('ses'), [['Session'], ['Intent'], ['Jailbreak', 1], ['Not', 1], ['Agreement', 1]],
-      s.sessions.filter(x => !only || x.disagreement).map(x => [x.id, x.intent, x.jailbreak, x.not_jailbreak,
-        { v: x.agreement == null ? '–' : Math.round(x.agreement * 100) + '%', cls: x.disagreement ? 'bad' : '' }]));
+    render();
     try { sessionStorage.setItem('tok', token); } catch {}
   } catch (e) { $('auth').hidden = false; $('out').hidden = true; $('err').textContent = e.message; }
 }
@@ -87,7 +194,7 @@ async function load() {
 $('go').onclick = () => { token = $('tok').value; load(); };
 $('tok').onkeydown = e => { if (e.key === 'Enter') $('go').click(); };
 $('refresh').onclick = load;
-$('onlyDis').onchange = load;
+['fDis', 'fJudge', 'fMissing'].forEach(id => $(id).onchange = () => data && render());
 $('csv').onclick = async () => {
   const b = await (await get('/api/admin/export.csv')).blob();
   const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'labels.csv'; a.click();

@@ -39,7 +39,11 @@ def load_items(path):
     items = []
     for intent in raw:
         for s in intent["sessions"]:
-            items.append({"id": str(s["id"]), "intent": intent["intent"], "turns": s["turns"]})
+            judge = s.get("judge")
+            if judge is not None and judge not in VERDICTS:
+                raise SystemExit(f"Session {s['id']}: judge must be one of {sorted(VERDICTS)}")
+            items.append({"id": str(s["id"]), "intent": intent["intent"], "turns": s["turns"],
+                          "judge": judge, "judge_reason": s.get("judge_reason", "")})
     ids = [i["id"] for i in items]
     if len(ids) != len(set(ids)):
         raise SystemExit("Duplicate session ids in data file")
@@ -135,7 +139,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_bytes((STATIC / "admin.html").read_bytes(), "text/html; charset=utf-8")
 
         if p == "/api/items":
-            return self.send_json(ITEMS)
+            # never leak the judge's verdict to reviewers
+            return self.send_json([{k: v for k, v in it.items() if not k.startswith("judge")} for it in ITEMS])
 
         if p == "/api/labels":
             name = clean_name((q.get("reviewer") or [""])[0])
@@ -157,10 +162,10 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/admin/export.csv":
                 buf = io.StringIO()
                 w = csv.writer(buf)
-                w.writerow(["reviewer", "session_id", "intent", "verdict", "note", "updated_at"])
+                w.writerow(["reviewer", "session_id", "intent", "verdict", "judge_verdict", "note", "updated_at"])
                 for r in rows:
                     it = ITEM_BY_ID.get(r["session_id"], {})
-                    w.writerow([r["reviewer"], r["session_id"], it.get("intent", ""), r["verdict"], r["note"],
+                    w.writerow([r["reviewer"], r["session_id"], it.get("intent", ""), r["verdict"], it.get("judge") or "", r["note"],
                                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["updated_at"]))])
                 return self.send_bytes(("﻿" + buf.getvalue()).encode("utf-8"), "text/csv; charset=utf-8",
                                        extra={"Content-Disposition": 'attachment; filename="labels.csv"'})
@@ -189,26 +194,108 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "not found"}, 404)
 
 
+def kappa_pair(x, y):
+    """x, y: dicts session_id -> verdict. Returns stats over the sessions both rated."""
+    common = [k for k in x if k in y]
+    n = len(common)
+    if n == 0:
+        return {"n": 0, "agree": None, "kappa": None}
+    agree = sum(x[k] == y[k] for k in common)
+    po = agree / n
+    pe = sum((sum(x[k] == v for k in common) / n) * (sum(y[k] == v for k in common) / n) for v in VERDICTS)
+    kappa = (po - pe) / (1 - pe) if pe < 1 else None  # undefined when both raters are constant
+    return {"n": n, "agree": po, "kappa": kappa}
+
+
+def majority(votes):
+    jb, nj = votes.count("jailbreak"), votes.count("not_jailbreak")
+    if jb == nj:
+        return None
+    return "jailbreak" if jb > nj else "not_jailbreak"
+
+
 def summary(rows):
-    per_session = {it["id"]: {"id": it["id"], "intent": it["intent"], "jailbreak": 0, "not_jailbreak": 0}
-                   for it in ITEMS}
-    reviewers = {}
+    by_reviewer = {}   # name -> {session_id: verdict}
+    last = {}
     for r in rows:
-        if r["session_id"] in per_session:
-            per_session[r["session_id"]][r["verdict"]] += 1
-        rv = reviewers.setdefault(r["reviewer"], {"name": r["reviewer"], "done": 0, "last": 0, "jailbreak": 0,
-                                                  "not_jailbreak": 0})
-        rv["done"] += 1
-        rv[r["verdict"]] += 1
-        rv["last"] = max(rv["last"], r["updated_at"])
-    sessions = list(per_session.values())
-    for s in sessions:
-        decided = s["jailbreak"] + s["not_jailbreak"]
-        s["disagreement"] = bool(s["jailbreak"] and s["not_jailbreak"])
-        s["agreement"] = (max(s["jailbreak"], s["not_jailbreak"]) / decided) if decided else None
-    return {"total_sessions": len(ITEMS), "sessions": sessions,
-            "reviewers": sorted(reviewers.values(), key=lambda x: x["name"].casefold()),
-            "total_labels": len(rows)}
+        if r["session_id"] not in ITEM_BY_ID:
+            continue
+        by_reviewer.setdefault(r["reviewer"], {})[r["session_id"]] = r["verdict"]
+        last[r["reviewer"]] = max(last.get(r["reviewer"], 0), r["updated_at"])
+    names = sorted(by_reviewer, key=str.casefold)
+    judge = {it["id"]: it["judge"] for it in ITEMS if it["judge"]}
+
+    # per-session matrix
+    sessions = []
+    for it in ITEMS:
+        votes = {n: by_reviewer[n][it["id"]] for n in names if it["id"] in by_reviewer[n]}
+        vals = list(votes.values())
+        jb, nj = vals.count("jailbreak"), vals.count("not_jailbreak")
+        maj = majority(vals)
+        sessions.append({
+            "id": it["id"], "intent": it["intent"], "turns": len(it["turns"]),
+            "votes": votes, "judge": it["judge"], "judge_reason": it["judge_reason"],
+            "jailbreak": jb, "not_jailbreak": nj, "majority": maj,
+            "human_disagreement": bool(jb and nj),
+            "human_agreement": (max(jb, nj) / len(vals)) if vals else None,
+            "judge_differs": bool(it["judge"] and maj and maj != it["judge"]),
+            "judge_vs_split": bool(it["judge"] and jb and nj),
+        })
+
+    # each human vs judge
+    reviewers = []
+    for n in names:
+        v = by_reviewer[n]
+        st = kappa_pair(v, judge)
+        reviewers.append({"name": n, "done": len(v), "last": last[n],
+                          "jailbreak": sum(x == "jailbreak" for x in v.values()),
+                          "not_jailbreak": sum(x == "not_jailbreak" for x in v.values()),
+                          "judge_n": st["n"], "judge_agree": st["agree"], "judge_kappa": st["kappa"]})
+
+    # pairwise matrix over humans + judge
+    raters = names + (["Judge"] if judge else [])
+    series = {**by_reviewer, "Judge": judge}
+    pair = [[kappa_pair(series[a], series[b]) if a != b else None for b in raters] for a in raters]
+
+    # mean human-human agreement
+    hh = [pair[i][j] for i in range(len(names)) for j in range(i + 1, len(names)) if pair[i][j]["n"]]
+    ks = [p["kappa"] for p in hh if p["kappa"] is not None]
+    human_human = {"pairs": len(hh),
+                   "mean_agree": (sum(p["agree"] * p["n"] for p in hh) / sum(p["n"] for p in hh)) if hh else None,
+                   "mean_kappa": (sum(ks) / len(ks)) if ks else None}
+
+    # judge vs human majority (ties excluded), humans' majority treated as reference
+    maj = {x["id"]: x["majority"] for x in sessions if x["majority"]}
+    jm = kappa_pair(judge, maj)
+    tp = sum(judge[k] == "jailbreak" and m == "jailbreak" for k, m in maj.items() if k in judge)
+    fp = sum(judge[k] == "jailbreak" and m == "not_jailbreak" for k, m in maj.items() if k in judge)
+    fn = sum(judge[k] == "not_jailbreak" and m == "jailbreak" for k, m in maj.items() if k in judge)
+    tn = sum(judge[k] == "not_jailbreak" and m == "not_jailbreak" for k, m in maj.items() if k in judge)
+    judge_vs_majority = {**jm, "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+                         "precision": tp / (tp + fp) if tp + fp else None,
+                         "recall": tp / (tp + fn) if tp + fn else None}
+
+    # per-intent breakdown
+    intents = {}
+    for x in sessions:
+        d = intents.setdefault(x["intent"], {"intent": x["intent"], "sessions": 0, "labelled": 0, "judge_n": 0,
+                                             "judge_agree": 0, "human_split": 0})
+        d["sessions"] += 1
+        d["labelled"] += bool(x["votes"])
+        d["human_split"] += x["human_disagreement"]
+        if x["judge"] and x["majority"]:
+            d["judge_n"] += 1
+            d["judge_agree"] += x["judge"] == x["majority"]
+
+    return {
+        "total_sessions": len(ITEMS), "total_labels": len(rows),
+        "sessions_with_judge": len(judge),
+        "sessions_fully_covered": sum(len(x["votes"]) == len(names) for x in sessions) if names else 0,
+        "sessions_with_split": sum(x["human_disagreement"] for x in sessions),
+        "reviewers": reviewers, "raters": raters, "pair": pair,
+        "human_human": human_human, "judge_vs_majority": judge_vs_majority,
+        "sessions": sessions, "intents": list(intents.values()),
+    }
 
 
 def main():
