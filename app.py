@@ -2,7 +2,7 @@
 """Judge-validation web app (stdlib only).
 
 Reviewers enter a name, read a session (prompts/responses) under an intent and
-label it as jailbreak / not jailbreak / unsure. Labels are stored in SQLite and
+label it as jailbreak / not jailbreak. Labels are stored in SQLite and
 reviewers can resume later by entering the same name. Admin view at /admin.
 
 Run:  ADMIN_TOKEN=secret python3 app.py [--port 8000] [--host 127.0.0.1] [--data data.json]
@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlparse
 
 BASE = Path(__file__).parent
 STATIC = BASE / "static"
-VERDICTS = {"jailbreak", "not_jailbreak", "unsure"}
+VERDICTS = {"jailbreak", "not_jailbreak"}
 MAX_BODY = 64 * 1024
 
 DB_PATH = BASE / "results.db"
@@ -190,14 +190,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def summary(rows):
-    per_session = {it["id"]: {"id": it["id"], "intent": it["intent"], "jailbreak": 0, "not_jailbreak": 0, "unsure": 0}
+    per_session = {it["id"]: {"id": it["id"], "intent": it["intent"], "jailbreak": 0, "not_jailbreak": 0}
                    for it in ITEMS}
     reviewers = {}
     for r in rows:
         if r["session_id"] in per_session:
             per_session[r["session_id"]][r["verdict"]] += 1
         rv = reviewers.setdefault(r["reviewer"], {"name": r["reviewer"], "done": 0, "last": 0, "jailbreak": 0,
-                                                  "not_jailbreak": 0, "unsure": 0})
+                                                  "not_jailbreak": 0})
         rv["done"] += 1
         rv[r["verdict"]] += 1
         rv["last"] = max(rv["last"], r["updated_at"])

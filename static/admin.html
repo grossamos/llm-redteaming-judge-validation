@@ -74,11 +74,11 @@ async function load() {
     const s = await (await get('/api/admin/summary')).json();
     $('auth').hidden = true; $('out').hidden = false;
     $('totals').textContent = `${s.total_labels} labels · ${s.reviewers.length} reviewers · ${s.total_sessions} sessions`;
-    fill($('rev'), [['Reviewer'], ['Done', 1], ['Jailbreak', 1], ['Not', 1], ['Unsure', 1], ['Last active']],
-      s.reviewers.map(r => [r.name, `${r.done}/${s.total_sessions}`, r.jailbreak, r.not_jailbreak, r.unsure, new Date(r.last * 1000).toLocaleString()]));
+    fill($('rev'), [['Reviewer'], ['Done', 1], ['Jailbreak', 1], ['Not', 1], ['Last active']],
+      s.reviewers.map(r => [r.name, `${r.done}/${s.total_sessions}`, r.jailbreak, r.not_jailbreak, new Date(r.last * 1000).toLocaleString()]));
     const only = $('onlyDis').checked;
-    fill($('ses'), [['Session'], ['Intent'], ['Jailbreak', 1], ['Not', 1], ['Unsure', 1], ['Agreement', 1]],
-      s.sessions.filter(x => !only || x.disagreement).map(x => [x.id, x.intent, x.jailbreak, x.not_jailbreak, x.unsure,
+    fill($('ses'), [['Session'], ['Intent'], ['Jailbreak', 1], ['Not', 1], ['Agreement', 1]],
+      s.sessions.filter(x => !only || x.disagreement).map(x => [x.id, x.intent, x.jailbreak, x.not_jailbreak,
         { v: x.agreement == null ? '–' : Math.round(x.agreement * 100) + '%', cls: x.disagreement ? 'bad' : '' }]));
     try { sessionStorage.setItem('tok', token); } catch {}
   } catch (e) { $('auth').hidden = false; $('out').hidden = true; $('err').textContent = e.message; }

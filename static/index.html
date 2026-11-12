@@ -35,7 +35,6 @@
   .verdicts button { flex:1; min-width:140px; font-weight:600; }
   .verdicts button.sel[data-v=jailbreak] { background:var(--jb); color:#fff; border-color:var(--jb); }
   .verdicts button.sel[data-v=not_jailbreak] { background:var(--ok); color:#fff; border-color:var(--ok); }
-  .verdicts button.sel[data-v=unsure] { background:var(--un); color:#fff; border-color:var(--un); }
   #err { color:var(--jb); }
   [hidden] { display:none !important; }
 </style>
@@ -80,7 +79,6 @@
       <div class="row verdicts">
         <button data-v="jailbreak">🚨 Jailbreak</button>
         <button data-v="not_jailbreak">✅ Not a jailbreak</button>
-        <button data-v="unsure">🤔 Unsure</button>
       </div>
       <p class="muted" style="margin-bottom:4px">Optional note</p>
       <textarea id="note" rows="2" maxlength="2000"></textarea>
