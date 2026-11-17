@@ -34,6 +34,25 @@
   .judgecol { border-left:2px solid var(--accent); }
   td.cell { text-align:center; white-space:nowrap; min-width:90px; }
   td.intent { min-width:220px; max-width:360px; }
+  .linkbtn { all:unset; cursor:pointer; color:var(--accent); text-decoration:underline; text-underline-offset:2px; }
+  .linkbtn:focus-visible { outline:2px solid var(--accent); border-radius:3px; }
+  button.danger { color:var(--bad); }
+  select { font:inherit; padding:8px 12px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:inherit; }
+  dialog { width:min(960px,96vw); max-height:92vh; padding:0; border:1px solid var(--line); border-radius:12px;
+           background:var(--card); color:var(--fg); }
+  dialog::backdrop { background:rgba(0,0,0,.5); }
+  .dhead { position:sticky; top:0; background:var(--card); padding:14px 18px; border-bottom:1px solid var(--line);
+           display:flex; gap:12px; justify-content:space-between; align-items:flex-start; z-index:1; }
+  .dbody { padding:6px 18px 18px; }
+  .sess { border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:14px 0; }
+  .sess.hl { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent); }
+  .sess h3 { margin:0 0 6px; font-size:1rem; }
+  .votes { margin:6px 0 10px; display:grid; gap:2px; }
+  .vote { display:flex; gap:8px; flex-wrap:wrap; }
+  .who { font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:8px 0 2px; }
+  .msg { white-space:pre-wrap; word-break:break-word; padding:8px 10px; border-radius:8px; background:var(--neu-bg); }
+  .msg.user { background:var(--user); }
+  :root { --user:#e8f0fe; } @media (prefers-color-scheme: dark) { :root { --user:#1f2b45; } }
   [hidden] { display:none !important; }
 </style>
 </head>
@@ -51,6 +70,7 @@
   <div id="out" hidden>
     <div class="card">
       <div class="row">
+        <label class="muted">Dataset <select id="dsSel"></select></label>
         <button id="refresh">Refresh</button>
         <button id="csv">Download CSV</button>
         <span id="totals" class="muted"></span>
@@ -65,7 +85,8 @@
 
     <div class="card"><h2>Agreement matrix <span class="muted">(Cohen's κ · % agree · n shared sessions)</span></h2><table id="pair"></table></div>
 
-    <div class="card"><h2>Reviewers vs judge</h2><table id="rev"></table></div>
+    <div class="card"><h2>Reviewers vs judge</h2><table id="rev"></table>
+      <p class="muted" style="margin-bottom:0">Deleting a reviewer permanently removes all of their labels in <b>every</b> dataset.</p></div>
 
     <div class="card">
       <div class="row" style="margin-bottom:8px">
@@ -81,22 +102,36 @@
     <div class="card"><h2>By intent</h2><table id="int"></table></div>
   </div>
 </main>
+
+<dialog id="dlg">
+  <div class="dhead">
+    <div><h2 id="dTitle" style="margin:0"></h2><div class="muted" id="dSub"></div></div>
+    <button id="dClose">Close ✕</button>
+  </div>
+  <div class="dbody" id="dBody"></div>
+</dialog>
 <script>
 const $ = id => document.getElementById(id);
-let token = '', data = null;
-try { token = sessionStorage.getItem('tok') || ''; } catch {}
+let token = '', data = null, dsel = '';
+try { token = sessionStorage.getItem('tok') || ''; dsel = sessionStorage.getItem('ds') || ''; } catch {}
 
 const pct = x => x == null ? '–' : Math.round(x * 100) + '%';
 const kap = x => x == null ? '–' : x.toFixed(2);
 const lab = v => v === 'jailbreak' ? '🚨 JB' : v === 'not_jailbreak' ? '✅ OK' : '–';
+const q = o => Object.entries(o).filter(([, v]) => v !== '' && v != null).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
 
-async function get(path) {
-  const r = await fetch(path, { headers: { 'X-Admin-Token': token } });
-  if (!r.ok) throw new Error(r.status === 401 ? 'Wrong token' : r.statusText);
+async function req(path, body) {
+  const opts = { headers: { 'X-Admin-Token': token } };
+  if (body !== undefined) { opts.method = 'POST'; opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let m = r.statusText; try { m = (await r.json()).error || m; } catch {}
+    throw new Error(r.status === 401 ? 'Wrong token' : m);
+  }
   return r;
 }
 
-// cells: string | {v, cls, title}
+// cells: string | {v, cls, title, click}
 function fill(table, head, rows) {
   table.replaceChildren();
   const tr = table.insertRow();
@@ -105,7 +140,11 @@ function fill(table, head, rows) {
     const tr = table.insertRow();
     r.forEach((c, i) => {
       const td = tr.insertCell(); const o = (c && typeof c === 'object') ? c : { v: c };
-      td.textContent = o.v ?? '';
+      if (o.click) {
+        const b = document.createElement('button'); b.className = 'linkbtn'; b.textContent = o.v; b.onclick = o.click;
+        if (o.btnCls) b.classList.add(o.btnCls);
+        td.append(b);
+      } else td.textContent = o.v ?? '';
       const hc = head[i].cls; if (hc) td.className = hc;
       if (o.cls) o.cls.split(' ').forEach(k => td.classList.add(k));
       if (o.title) td.title = o.title;
@@ -120,9 +159,64 @@ function stat(v, l) {
   d.append(a, b); return d;
 }
 
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+// ---- intent viewer ----
+async function openIntent(dataset, index, highlightId) {
+  let d;
+  try { d = await (await req('/api/admin/intent?' + q({ dataset, index }))).json(); }
+  catch (e) { alert(e.message); return; }
+  $('dTitle').textContent = d.intent;
+  $('dSub').textContent = `Dataset: ${d.dataset} · ${d.sessions.length} attempt${d.sessions.length === 1 ? '' : 's'}`;
+  const body = $('dBody'); body.replaceChildren();
+  let target = null;
+  d.sessions.forEach(x => {
+    const box = el('div', 'sess' + (x.id === highlightId ? ' hl' : ''));
+    if (x.id === highlightId) target = box;
+    box.append(el('h3', null, 'Attempt ' + x.id));
+    const j = el('div', 'muted');
+    j.textContent = 'Judge: ' + (x.judge ? lab(x.judge) : 'no verdict') + (x.judge_reason ? ' — ' + x.judge_reason : '');
+    box.append(j);
+    const votes = el('div', 'votes');
+    if (!x.votes.length) votes.append(el('span', 'muted', 'No human labels yet.'));
+    x.votes.forEach(v => {
+      const row = el('div', 'vote');
+      const cls = !x.judge ? '' : v.verdict === x.judge ? 'ok' : 'jb';
+      row.append(el('b', cls, `${v.reviewer}: ${lab(v.verdict)}`));
+      if (v.note) row.append(el('span', 'muted', '“' + v.note + '”'));
+      votes.append(row);
+    });
+    box.append(votes);
+    x.turns.forEach((t, i) => {
+      box.append(el('div', 'who', `Prompt ${i + 1}`), el('div', 'msg user', t.prompt ?? ''));
+      box.append(el('div', 'who', `Response ${i + 1}`), el('div', 'msg', t.response ?? ''));
+    });
+    body.append(box);
+  });
+  if (!$('dlg').open) $('dlg').showModal();
+  if (target) target.scrollIntoView({ block: 'start' }); else $('dlg').scrollTop = 0;
+}
+$('dClose').onclick = () => $('dlg').close();
+$('dlg').addEventListener('click', e => { if (e.target === $('dlg')) $('dlg').close(); });
+
+// ---- delete reviewer ----
+async function delReviewer(r) {
+  if (!confirm(`Permanently delete reviewer “${r.name}” and ALL ${r.labels_all} of their labels (in every dataset)?\n\nThis cannot be undone. Download the CSV first if you may need them.`)) return;
+  try { const j = await (await req('/api/admin/delete-reviewer', { name: r.name })).json(); await load(); alert(`Deleted ${j.deleted} labels.`); }
+  catch (e) { alert(e.message); }
+}
+
+// ---- render ----
 function render() {
   const s = data, jm = s.judge_vs_majority, hh = s.human_human;
-  $('totals').textContent = `${s.total_labels} labels · ${s.reviewers.length} reviewers · ${s.total_sessions} sessions (${s.sessions_with_judge} with judge verdict)`;
+  const multi = s.datasets.length > 1;
+  $('totals').textContent = `${s.total_labels} labels · ${s.reviewers.length} reviewers · ${s.total_sessions} sessions (${s.sessions_with_judge} with judge verdict)`
+    + (s.ignored_labels ? ` · ${s.ignored_labels} labels with an unknown verdict ignored` : '');
+
+  const sel = $('dsSel'); sel.replaceChildren();
+  sel.append(new Option(multi ? 'All datasets' : s.datasets[0]?.id ?? '—', ''));
+  if (multi) s.datasets.forEach(d => sel.append(new Option(`${d.id} (${d.sessions})`, d.id)));
+  sel.value = s.dataset || ''; sel.disabled = !multi;
 
   $('stats').replaceChildren(
     stat(kap(jm.kappa), `κ judge vs human majority (n=${jm.n})`),
@@ -149,22 +243,25 @@ function render() {
 
   // reviewers
   fill($('rev'), ['Reviewer', { t: 'Done', cls: 'n' }, { t: 'JB', cls: 'n' }, { t: 'OK', cls: 'n' }, { t: 'JB rate', cls: 'n' },
-      { t: 'Agree w/ judge', cls: 'n' }, { t: 'κ vs judge', cls: 'n' }, { t: 'Shared n', cls: 'n' }, 'Last active'],
+      { t: 'Agree w/ judge', cls: 'n' }, { t: 'κ vs judge', cls: 'n' }, { t: 'Shared n', cls: 'n' }, 'Last active', ''],
     s.reviewers.map(r => [r.name, { v: `${r.done}/${s.total_sessions}`, cls: 'n' }, { v: r.jailbreak, cls: 'n' }, { v: r.not_jailbreak, cls: 'n' },
       { v: pct(r.done ? r.jailbreak / r.done : null), cls: 'n' }, { v: pct(r.judge_agree), cls: 'n' }, { v: kap(r.judge_kappa), cls: 'n' },
-      { v: r.judge_n, cls: 'n' }, new Date(r.last * 1000).toLocaleString()]));
+      { v: r.judge_n, cls: 'n' }, new Date(r.last * 1000).toLocaleString(),
+      { v: 'Delete', click: () => delReviewer(r), btnCls: 'danger', title: `Delete ${r.name} and all ${r.labels_all} labels` }]));
 
   // attempts table
-  const names = s.reviewers.map(r => r.name);
+  const names = s.humans;
+  const showDs = multi && !s.dataset;
   const rows = s.sessions.filter(x =>
     (!$('fDis').checked || x.human_disagreement) &&
     (!$('fJudge').checked || x.judge_differs) &&
     (!$('fMissing').checked || Object.keys(x.votes).length < names.length));
-  fill($('ses'), ['Attempt', 'Intent', ...names.map((n, i) => ({ t: n, cls: 'c' })), { t: 'Judge', cls: 'c judgecol' },
+  fill($('ses'), [...(showDs ? ['Dataset'] : []), 'Attempt', 'Intent', ...names.map(n => ({ t: n, cls: 'c' })), { t: 'Judge', cls: 'c judgecol' },
       { t: 'Human majority', cls: 'c' }, { t: 'Human agr.', cls: 'n' }],
     rows.map(x => [
-      x.id,
-      { v: x.intent, cls: 'intent' },
+      ...(showDs ? [x.dataset] : []),
+      { v: x.id, click: () => openIntent(x.dataset, x.intent_idx, x.id), title: 'Open this attempt and its intent' },
+      { v: x.intent, cls: 'intent', click: () => openIntent(x.dataset, x.intent_idx), title: 'Open all attempts for this intent' },
       ...names.map(n => {
         const v = x.votes[n];
         if (!v) return { v: '·', cls: 'cell neutral', title: 'not reviewed yet' };
@@ -177,26 +274,30 @@ function render() {
     ]));
 
   // intents
-  fill($('int'), ['Intent', { t: 'Sessions', cls: 'n' }, { t: 'Reviewed', cls: 'n' }, { t: 'Humans split', cls: 'n' }, { t: 'Judge = majority', cls: 'n' }],
-    s.intents.map(i => [i.intent, { v: i.sessions, cls: 'n' }, { v: i.labelled, cls: 'n' }, { v: i.human_split, cls: 'n' },
+  fill($('int'), [...(showDs ? ['Dataset'] : []), 'Intent', { t: 'Sessions', cls: 'n' }, { t: 'Reviewed', cls: 'n' }, { t: 'Humans split', cls: 'n' }, { t: 'Judge = majority', cls: 'n' }],
+    s.intents.map(i => [...(showDs ? [i.dataset] : []),
+      { v: i.intent, click: () => openIntent(i.dataset, i.intent_idx), title: 'Open this intent' },
+      { v: i.sessions, cls: 'n' }, { v: i.labelled, cls: 'n' }, { v: i.human_split, cls: 'n' },
       { v: i.judge_n ? `${i.judge_agree}/${i.judge_n} (${pct(i.judge_agree / i.judge_n)})` : '–', cls: 'n' }]));
 }
 
 async function load() {
   try {
-    data = await (await get('/api/admin/summary')).json();
+    data = await (await req('/api/admin/summary?' + q({ dataset: dsel }))).json();
+    if (dsel && data.dataset !== dsel) dsel = '';
     $('auth').hidden = true; $('out').hidden = false;
     render();
-    try { sessionStorage.setItem('tok', token); } catch {}
+    try { sessionStorage.setItem('tok', token); sessionStorage.setItem('ds', dsel); } catch {}
   } catch (e) { $('auth').hidden = false; $('out').hidden = true; $('err').textContent = e.message; }
 }
 
 $('go').onclick = () => { token = $('tok').value; load(); };
 $('tok').onkeydown = e => { if (e.key === 'Enter') $('go').click(); };
 $('refresh').onclick = load;
+$('dsSel').onchange = () => { dsel = $('dsSel').value; load(); };
 ['fDis', 'fJudge', 'fMissing'].forEach(id => $(id).onchange = () => data && render());
 $('csv').onclick = async () => {
-  const b = await (await get('/api/admin/export.csv')).blob();
+  const b = await (await req('/api/admin/export.csv?' + q({ dataset: dsel }))).blob();
   const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'labels.csv'; a.click();
 };
 if (token) load();

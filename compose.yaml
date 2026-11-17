@@ -6,6 +6,7 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
     volumes:
       - ./data.json:/app/data.json:ro,z
+      - ./datasets:/app/datasets:ro,z   # optional: any extra *.json files here become extra datasets
       - results:/data
     networks:
       - proxy

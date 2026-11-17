@@ -36,6 +36,7 @@
   .verdicts button.sel[data-v=jailbreak] { background:var(--jb); color:#fff; border-color:var(--jb); }
   .verdicts button.sel[data-v=not_jailbreak] { background:var(--ok); color:#fff; border-color:var(--ok); }
   #err { color:var(--jb); }
+  .dsrow { padding:10px 0; border-top:1px solid var(--line); }
   [hidden] { display:none !important; }
 </style>
 </head>
@@ -52,11 +53,23 @@
     <p id="err"></p>
   </section>
 
+  <section id="datasets" class="card" hidden>
+    <div class="row spread">
+      <span>Reviewer: <b id="who2"></b></span>
+      <button id="logout2">Switch reviewer</button>
+    </div>
+    <p>Choose a dataset to review. You can switch at any time; your answers are saved per dataset.</p>
+    <div id="dslist"></div>
+  </section>
+
   <section id="review" hidden>
     <div class="card">
       <div class="row spread">
         <span>Reviewer: <b id="who"></b></span>
-        <button id="logout">Switch reviewer</button>
+        <span class="row">
+          <button id="alldatasets" hidden>← All datasets</button>
+          <button id="logout">Switch reviewer</button>
+        </span>
       </div>
       <div class="bar" style="margin:10px 0 4px"><div id="barfill" style="width:0"></div></div>
       <div class="muted" id="progress"></div>
@@ -96,7 +109,7 @@
 
 <script>
 const $ = id => document.getElementById(id);
-let items = [], labels = {}, idx = 0, reviewer = null, verdict = null;
+let datasets = [], allLabels = {}, ds = null, items = [], labels = {}, idx = 0, reviewer = null, verdict = null;
 
 const store = {
   get() { try { return localStorage.getItem('reviewer'); } catch { return null; } },
@@ -115,15 +128,43 @@ async function login(name) {
   name = name.trim();
   if (!name) { $('err').textContent = 'Please enter a name.'; return; }
   try {
-    const [it, lab] = await Promise.all([
-      api('/api/items'),
+    const [dsl, lab] = await Promise.all([
+      api('/api/datasets'),
       api('/api/labels?reviewer=' + encodeURIComponent(name)),
     ]);
-    items = it; labels = lab.labels; reviewer = lab.reviewer;
+    datasets = dsl; allLabels = lab.labels; reviewer = lab.reviewer;
   } catch (e) { $('err').textContent = e.message; return; }
   store.set(reviewer);
-  $('login').hidden = true; $('review').hidden = false;
-  $('who').textContent = reviewer;
+  $('login').hidden = true;
+  $('who').textContent = $('who2').textContent = reviewer;
+  if (datasets.length === 1) await openDataset(datasets[0].id); else showDatasets();
+}
+
+function showDatasets() {
+  $('review').hidden = true; $('datasets').hidden = false;
+  const list = $('dslist'); list.replaceChildren();
+  datasets.forEach(d => {
+    const n = Object.keys(allLabels[d.id] || {}).length;
+    const row = document.createElement('div'); row.className = 'row spread dsrow';
+    const left = document.createElement('div');
+    const t = document.createElement('b'); t.textContent = d.id;
+    const m = document.createElement('div'); m.className = 'muted';
+    m.textContent = `${n} of ${d.sessions} labelled` + (n >= d.sessions ? ' ✓' : '');
+    left.append(t, m);
+    const b = document.createElement('button'); b.className = 'primary';
+    b.textContent = n >= d.sessions ? 'Review' : n ? 'Resume' : 'Start';
+    b.onclick = () => openDataset(d.id);
+    row.append(left, b); list.append(row);
+  });
+}
+
+async function openDataset(id) {
+  try { items = await api('/api/items?dataset=' + encodeURIComponent(id)); }
+  catch (e) { alert(e.message); return; }
+  ds = id;
+  labels = allLabels[id] = allLabels[id] || {};
+  $('datasets').hidden = true; $('review').hidden = false;
+  $('alldatasets').hidden = datasets.length < 2;
   idx = firstOpen(0);
   if (idx < 0) idx = 0;
   render();
@@ -137,15 +178,19 @@ function firstOpen(from) {
   return -1;
 }
 
+function updateProgress() {
+  const n = Object.keys(labels).length;
+  $('barfill').style.width = (100 * n / items.length) + '%';
+  $('progress').textContent = (datasets.length > 1 ? ds + ' · ' : '') + `${n} of ${items.length} labelled · viewing session ${idx + 1}`;
+  $('done').hidden = n < items.length;
+}
+
 function render() {
   const it = items[idx];
   if (!it) { $('intent').textContent = 'No sessions loaded.'; return; }
-  const n = Object.keys(labels).length;
-  $('barfill').style.width = (100 * n / items.length) + '%';
-  $('progress').textContent = `${n} of ${items.length} labelled · viewing session ${idx + 1}`;
-  $('done').hidden = n < items.length;
+  updateProgress();
   $('intent').textContent = it.intent;
-  $('sid').textContent = 'Session ' + it.id;
+  $('sid').textContent = `Session ${idx + 1} of ${items.length}`;
   const conv = $('conv'); conv.replaceChildren();
   it.turns.forEach((t, i) => {
     const d = document.createElement('div'); d.className = 'turn';
@@ -175,7 +220,7 @@ async function save() {
   const it = items[idx];
   try {
     await api('/api/label', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reviewer, session_id: it.id, verdict, note: $('note').value }) });
+      body: JSON.stringify({ reviewer, dataset: ds, session_id: it.id, verdict, note: $('note').value }) });
     labels[it.id] = { verdict, note: $('note').value };
     $('saved').textContent = 'Saved ✓';
     return true;
@@ -183,11 +228,7 @@ async function save() {
 }
 
 document.querySelectorAll('.verdicts button').forEach(b => b.onclick = async () => {
-  verdict = b.dataset.v; markSelected(); await save();
-  const n = Object.keys(labels).length;
-  $('barfill').style.width = (100 * n / items.length) + '%';
-  $('progress').textContent = `${n} of ${items.length} labelled · viewing session ${idx + 1}`;
-  $('done').hidden = n < items.length;
+  verdict = b.dataset.v; markSelected(); await save(); updateProgress();
 });
 $('note').onchange = save;
 $('prev').onclick = async () => { if (await save() && idx > 0) { idx--; render(); } };
@@ -197,9 +238,11 @@ $('nextOpen').onclick = async () => {
   const j = firstOpen(idx + 1);
   if (j >= 0) { idx = j; render(); } else $('saved').textContent = 'No unlabelled sessions left 🎉';
 };
+$('alldatasets').onclick = async () => { if (await save()) showDatasets(); };
 $('start').onclick = () => login($('name').value);
 $('name').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) login($('name').value); };
-$('logout').onclick = () => { store.set(null); location.reload(); };
+const logout = () => { store.set(null); location.reload(); };
+$('logout').onclick = logout; $('logout2').onclick = logout;
 
 const saved = store.get();
 if (saved) { $('name').value = saved; login(saved); }

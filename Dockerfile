@@ -5,4 +5,4 @@ COPY app.py ./
 COPY static ./static
 USER app
 EXPOSE 8000
-CMD ["python", "app.py", "--host", "0.0.0.0", "--port", "8000", "--data", "/app/data.json", "--db", "/data/results.db"]
+CMD ["python", "app.py", "--host", "0.0.0.0", "--port", "8000", "--data", "/app/data.json", "/app/datasets", "--db", "/data/results.db"]

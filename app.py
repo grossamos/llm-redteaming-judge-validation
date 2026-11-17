@@ -5,7 +5,11 @@ Reviewers enter a name, read a session (prompts/responses) under an intent and
 label it as jailbreak / not jailbreak. Labels are stored in SQLite and
 reviewers can resume later by entering the same name. Admin view at /admin.
 
-Run:  ADMIN_TOKEN=secret python3 app.py [--port 8000] [--host 127.0.0.1] [--data data.json]
+Several data files ("datasets") can be served at once. Every *.json file given
+via --data (or found in a directory given via --data) is one dataset, named
+after the file (data.json -> "data").
+
+Run:  ADMIN_TOKEN=secret python3 app.py [--port 8000] [--host 127.0.0.1] [--data data.json datasets/]
 """
 import argparse
 import csv
@@ -15,8 +19,11 @@ import json
 import os
 import secrets
 import sqlite3
+import sys
 import time
 import unicodedata
+from collections import Counter
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -25,58 +32,173 @@ BASE = Path(__file__).parent
 STATIC = BASE / "static"
 VERDICTS = {"jailbreak", "not_jailbreak"}
 MAX_BODY = 64 * 1024
+# Labels written before multi-dataset support have no dataset. They are attached
+# to the dataset that contains their session id (preferring this one if ambiguous).
+LEGACY_DATASET = "data"
 
 DB_PATH = BASE / "results.db"
-ITEMS = []        # flat list of sessions, in presentation order
-ITEM_BY_ID = {}
+DATASETS = {}       # dataset id -> {"id", "file", "items", "intents"}
+ITEMS = []          # all sessions, dataset order then file order
+ITEM_BY_KEY = {}    # (dataset id, session id) -> item
 ADMIN_TOKEN = ""
 
 
 # ---------- data ----------
-def load_items(path):
-    """data.json: [{"intent": str, "sessions": [{"id": str, "turns": [{"prompt","response"}]}]}]"""
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    items = []
-    for intent in raw:
+def fail(msg):
+    raise SystemExit(f"Data error: {msg}")
+
+
+def discover(paths):
+    """Expand files/directories into a de-duplicated list of .json files."""
+    files, seen = [], set()
+    for p in map(Path, paths):
+        if p.is_dir():
+            found = sorted(p.glob("*.json"))
+        elif p.is_file():
+            found = [p]
+        else:
+            print(f"  skipping {p} (does not exist)")
+            continue
+        for f in found:
+            r = f.resolve()
+            if r not in seen:
+                seen.add(r)
+                files.append(f)
+    return files
+
+
+def load_dataset(path):
+    """File format: [{"intent": str, "sessions": [{"id": str, "turns": [{"prompt","response"}],
+    "judge": "jailbreak"|"not_jailbreak" (optional), "judge_reason": str (optional)}]}]"""
+    name = path.name
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:
+        fail(f"{name}: cannot read as JSON ({e})")
+    if not isinstance(raw, list):
+        fail(f"{name}: top level must be a list of intents")
+    items, seen, intents = [], set(), []
+    for ii, intent in enumerate(raw):
+        if not (isinstance(intent, dict) and isinstance(intent.get("intent"), str)
+                and isinstance(intent.get("sessions"), list)):
+            fail(f"{name}: intent #{ii + 1} needs a string 'intent' and a list 'sessions'")
+        intents.append(intent["intent"])
         for s in intent["sessions"]:
+            if not (isinstance(s, dict) and "id" in s and isinstance(s.get("turns"), list)
+                    and all(isinstance(t, dict) for t in s["turns"])):
+                fail(f"{name}: every session needs an 'id' and a list of 'turns' (objects with prompt/response); "
+                     f"problem in intent #{ii + 1}")
+            sid = str(s["id"])
+            if sid in seen:
+                fail(f"{name}: duplicate session id {sid!r}")
+            seen.add(sid)
             judge = s.get("judge")
             if judge is not None and judge not in VERDICTS:
-                raise SystemExit(f"Session {s['id']}: judge must be one of {sorted(VERDICTS)}")
-            items.append({"id": str(s["id"]), "intent": intent["intent"], "turns": s["turns"],
-                          "judge": judge, "judge_reason": s.get("judge_reason", "")})
-    ids = [i["id"] for i in items]
-    if len(ids) != len(set(ids)):
-        raise SystemExit("Duplicate session ids in data file")
-    return items
+                fail(f"{name}: session {sid!r}: judge must be one of {sorted(VERDICTS)}")
+            items.append({"dataset": path.stem, "id": sid, "intent_idx": ii, "intent": intent["intent"],
+                          "turns": s["turns"], "judge": judge, "judge_reason": s.get("judge_reason", "")})
+    return {"id": path.stem, "file": name, "items": items, "intents": intents}
+
+
+def public_item(it):
+    # never leak the judge's verdict to reviewers
+    return {k: v for k, v in it.items() if not k.startswith("judge")}
+
+
+def resolve_dataset(name):
+    """Dataset id from a request; falls back to the legacy/only dataset for old clients."""
+    if name in DATASETS:
+        return name
+    if not name:
+        if LEGACY_DATASET in DATASETS:
+            return LEGACY_DATASET
+        if len(DATASETS) == 1:
+            return next(iter(DATASETS))
+    return None
 
 
 # ---------- db ----------
+@contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+    c = sqlite3.connect(DB_PATH, timeout=10)
+    c.row_factory = sqlite3.Row
+    try:
+        with c:  # commit / rollback
+            yield c
+    finally:
+        c.close()
+
+
+SCHEMA = """CREATE TABLE IF NOT EXISTS labels (
+    reviewer   TEXT NOT NULL,
+    dataset    TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    verdict    TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (reviewer, dataset, session_id)
+)"""
 
 
 def init_db():
-    with db() as c:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)  # manual transactions
+    c.row_factory = sqlite3.Row
+    try:
         c.execute("PRAGMA journal_mode=WAL")
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS labels (
-                reviewer   TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                verdict    TEXT NOT NULL,
-                note       TEXT NOT NULL DEFAULT '',
-                updated_at REAL NOT NULL,
-                PRIMARY KEY (reviewer, session_id)
-            )"""
-        )
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(labels)")]
+        if not cols:
+            c.execute(SCHEMA)
+        elif "dataset" not in cols:
+            migrate_to_datasets(c)
+    finally:
+        c.close()
+
+
+def migrate_to_datasets(c):
+    """labels(reviewer, session_id, ...) -> labels(reviewer, dataset, session_id, ...)"""
+    bak = DB_PATH.with_name(DB_PATH.name + ".bak-pre-datasets")
+    if not bak.exists():
+        dst = sqlite3.connect(bak)
+        c.backup(dst)
+        dst.close()
+        print(f"Migrating database to multi-dataset schema (backup: {bak})")
+
+    owners = {}  # session id -> datasets containing it
+    for d in DATASETS.values():
+        for it in d["items"]:
+            owners.setdefault(it["id"], []).append(d["id"])
+
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        c.execute("ALTER TABLE labels RENAME TO labels_old")
+        c.execute(SCHEMA)
+        orphans = 0
+        for r in c.execute("SELECT * FROM labels_old").fetchall():
+            cands = owners.get(r["session_id"], [])
+            if len(cands) == 1:
+                ds = cands[0]
+            elif LEGACY_DATASET in cands or not cands:
+                ds = LEGACY_DATASET
+                orphans += not cands
+            else:
+                ds = cands[0]
+            c.execute("INSERT OR REPLACE INTO labels VALUES (?,?,?,?,?,?)",
+                      (r["reviewer"], ds, r["session_id"], r["verdict"], r["note"], r["updated_at"]))
+        c.execute("DROP TABLE labels_old")
+        c.execute("COMMIT")
+    except BaseException:
+        c.execute("ROLLBACK")
+        raise
+    if orphans:
+        print(f"  {orphans} old labels belong to sessions that are not in any dataset; kept as '{LEGACY_DATASET}'")
 
 
 def clean_name(name):
     if not isinstance(name, str):
         return None
     name = unicodedata.normalize("NFC", name).strip()
-    # drop control chars, keep everything else (unicode, emoji)
+    # drop control chars, keep everything else (unicode, emoji, joiners)
     name = "".join(ch for ch in name if unicodedata.category(ch)[0] != "C" or ch in "‍️")
     name = " ".join(name.split())
     if not name or len(name) > 64:
@@ -86,7 +208,7 @@ def clean_name(name):
 
 # ---------- http ----------
 class Handler(BaseHTTPRequestHandler):
-    server_version = "JudgeValidation/1.0"
+    server_version = "JudgeValidation/2.0"
 
     def log_message(self, fmt, *args):
         pass
@@ -132,70 +254,128 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         q = parse_qs(url.query)
         p = url.path
+        arg = lambda k: (q.get(k) or [""])[0]
 
         if p in ("/", "/index.html"):
             return self.send_bytes((STATIC / "index.html").read_bytes(), "text/html; charset=utf-8")
         if p in ("/admin", "/admin.html"):
             return self.send_bytes((STATIC / "admin.html").read_bytes(), "text/html; charset=utf-8")
 
+        if p == "/api/datasets":
+            return self.send_json([{"id": d["id"], "sessions": len(d["items"]), "intents": len(d["intents"])}
+                                   for d in DATASETS.values()])
+
         if p == "/api/items":
-            # never leak the judge's verdict to reviewers
-            return self.send_json([{k: v for k, v in it.items() if not k.startswith("judge")} for it in ITEMS])
+            ds = resolve_dataset(arg("dataset"))
+            if not ds:
+                return self.send_json({"error": "unknown dataset"}, 400)
+            return self.send_json([public_item(it) for it in DATASETS[ds]["items"]])
 
         if p == "/api/labels":
-            name = clean_name((q.get("reviewer") or [""])[0])
+            name = clean_name(arg("reviewer"))
             if not name:
                 return self.send_json({"error": "invalid reviewer name"}, 400)
             with db() as c:
-                rows = c.execute(
-                    "SELECT session_id, verdict, note FROM labels WHERE reviewer=?", (name,)
-                ).fetchall()
-            return self.send_json({"reviewer": name, "labels": {r["session_id"]: {"verdict": r["verdict"], "note": r["note"]} for r in rows}})
+                rows = c.execute("SELECT dataset, session_id, verdict, note FROM labels WHERE reviewer=?",
+                                 (name,)).fetchall()
+            labels = {d: {} for d in DATASETS}
+            for r in rows:
+                # rows with a verdict that no longer exists (e.g. the removed "unsure") count as unanswered
+                if r["dataset"] in labels and r["verdict"] in VERDICTS:
+                    labels[r["dataset"]][r["session_id"]] = {"verdict": r["verdict"], "note": r["note"]}
+            return self.send_json({"reviewer": name, "labels": labels})
 
         if p.startswith("/api/admin/"):
             if not self.is_admin():
                 return self.send_json({"error": "unauthorized"}, 401)
+            ds = arg("dataset")
+            if ds and ds not in DATASETS:
+                return self.send_json({"error": "unknown dataset"}, 400)
+
+            if p == "/api/admin/intent":
+                try:
+                    idx = int(arg("index"))
+                except ValueError:
+                    return self.send_json({"error": "bad index"}, 400)
+                if not ds:
+                    return self.send_json({"error": "dataset required"}, 400)
+                sess = [it for it in DATASETS[ds]["items"] if it["intent_idx"] == idx]
+                if not sess:
+                    return self.send_json({"error": "not found"}, 404)
+                with db() as c:
+                    rows = c.execute("SELECT reviewer, session_id, verdict, note, updated_at FROM labels "
+                                     "WHERE dataset=? ORDER BY reviewer COLLATE NOCASE", (ds,)).fetchall()
+                votes = {}
+                for r in rows:
+                    votes.setdefault(r["session_id"], []).append(
+                        {"reviewer": r["reviewer"], "verdict": r["verdict"], "note": r["note"],
+                         "updated_at": r["updated_at"]})
+                return self.send_json({
+                    "dataset": ds, "index": idx, "intent": sess[0]["intent"],
+                    "sessions": [{"id": it["id"], "turns": it["turns"], "judge": it["judge"],
+                                  "judge_reason": it["judge_reason"], "votes": votes.get(it["id"], [])}
+                                 for it in sess]})
+
             with db() as c:
                 rows = c.execute("SELECT * FROM labels ORDER BY updated_at").fetchall()
             if p == "/api/admin/summary":
-                return self.send_json(summary(rows))
+                return self.send_json(summary(rows, ds or None))
             if p == "/api/admin/export.csv":
                 buf = io.StringIO()
                 w = csv.writer(buf)
-                w.writerow(["reviewer", "session_id", "intent", "verdict", "judge_verdict", "note", "updated_at"])
+                w.writerow(["reviewer", "session_id", "intent", "verdict", "judge_verdict", "note", "updated_at", "dataset"])
                 for r in rows:
-                    it = ITEM_BY_ID.get(r["session_id"], {})
-                    w.writerow([r["reviewer"], r["session_id"], it.get("intent", ""), r["verdict"], it.get("judge") or "", r["note"],
-                                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["updated_at"]))])
+                    if ds and r["dataset"] != ds:
+                        continue
+                    it = ITEM_BY_KEY.get((r["dataset"], r["session_id"]), {})
+                    w.writerow([r["reviewer"], r["session_id"], it.get("intent", ""), r["verdict"],
+                                it.get("judge") or "", r["note"],
+                                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["updated_at"])), r["dataset"]])
                 return self.send_bytes(("﻿" + buf.getvalue()).encode("utf-8"), "text/csv; charset=utf-8",
                                        extra={"Content-Disposition": 'attachment; filename="labels.csv"'})
         self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
         p = urlparse(self.path).path
+
         if p == "/api/label":
             d = self.read_json()
             if not isinstance(d, dict):
                 return self.send_json({"error": "bad request"}, 400)
             name = clean_name(d.get("reviewer"))
+            ds = resolve_dataset(d.get("dataset"))
             sid, verdict = d.get("session_id"), d.get("verdict")
             note = d.get("note", "")
-            if not name or sid not in ITEM_BY_ID or verdict not in VERDICTS or not isinstance(note, str):
+            if (not name or not ds or (ds, sid) not in ITEM_BY_KEY or verdict not in VERDICTS
+                    or not isinstance(note, str)):
                 return self.send_json({"error": "invalid input"}, 400)
             with db() as c:
                 c.execute(
-                    """INSERT INTO labels (reviewer, session_id, verdict, note, updated_at)
-                       VALUES (?,?,?,?,?)
-                       ON CONFLICT(reviewer, session_id) DO UPDATE SET
+                    """INSERT INTO labels (reviewer, dataset, session_id, verdict, note, updated_at)
+                       VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(reviewer, dataset, session_id) DO UPDATE SET
                          verdict=excluded.verdict, note=excluded.note, updated_at=excluded.updated_at""",
-                    (name, sid, verdict, note[:2000], time.time()),
+                    (name, ds, sid, verdict, note[:2000], time.time()),
                 )
             return self.send_json({"ok": True})
+
+        if p == "/api/admin/delete-reviewer":
+            if not self.is_admin():
+                return self.send_json({"error": "unauthorized"}, 401)
+            d = self.read_json()
+            name = d.get("name") if isinstance(d, dict) else None
+            if not isinstance(name, str) or not name:
+                return self.send_json({"error": "bad request"}, 400)
+            with db() as c:  # exact match on the stored name, across all datasets
+                n = c.execute("DELETE FROM labels WHERE reviewer=?", (name,)).rowcount
+            return self.send_json({"deleted": n})
+
         self.send_json({"error": "not found"}, 404)
 
 
+# ---------- statistics ----------
 def kappa_pair(x, y):
-    """x, y: dicts session_id -> verdict. Returns stats over the sessions both rated."""
+    """x, y: dicts key -> verdict. Returns stats over the keys both rated."""
     common = [k for k in x if k in y]
     n = len(common)
     if n == 0:
@@ -214,40 +394,48 @@ def majority(votes):
     return "jailbreak" if jb > nj else "not_jailbreak"
 
 
-def summary(rows):
-    by_reviewer = {}   # name -> {session_id: verdict}
-    last = {}
-    for r in rows:
-        if r["session_id"] not in ITEM_BY_ID:
-            continue
-        by_reviewer.setdefault(r["reviewer"], {})[r["session_id"]] = r["verdict"]
-        last[r["reviewer"]] = max(last.get(r["reviewer"], 0), r["updated_at"])
-    names = sorted(by_reviewer, key=str.casefold)
-    judge = {it["id"]: it["judge"] for it in ITEMS if it["judge"]}
+def summary(rows, dataset=None):
+    """Statistics for one dataset, or for all of them when dataset is None."""
+    items = [it for d in DATASETS.values() if dataset in (None, d["id"]) for it in d["items"]]
+    key = lambda it: (it["dataset"], it["id"])
+    selected = {key(it) for it in items}
+
+    in_sel = [r for r in rows if (r["dataset"], r["session_id"]) in selected]
+    valid = [r for r in in_sel if r["verdict"] in VERDICTS]
+
+    by_reviewer = {}   # name -> {(dataset, session_id): verdict}
+    for r in valid:
+        by_reviewer.setdefault(r["reviewer"], {})[(r["dataset"], r["session_id"])] = r["verdict"]
+    names = sorted(by_reviewer, key=str.casefold)   # reviewers with labels in this selection
+    judge = {key(it): it["judge"] for it in items if it["judge"]}
 
     # per-session matrix
-    sessions = []
-    for it in ITEMS:
-        votes = {n: by_reviewer[n][it["id"]] for n in names if it["id"] in by_reviewer[n]}
+    sessions, maj = [], {}
+    for it in items:
+        votes = {n: by_reviewer[n][key(it)] for n in names if key(it) in by_reviewer[n]}
         vals = list(votes.values())
         jb, nj = vals.count("jailbreak"), vals.count("not_jailbreak")
-        maj = majority(vals)
+        m = majority(vals)
+        if m:
+            maj[key(it)] = m
         sessions.append({
-            "id": it["id"], "intent": it["intent"], "turns": len(it["turns"]),
-            "votes": votes, "judge": it["judge"], "judge_reason": it["judge_reason"],
-            "jailbreak": jb, "not_jailbreak": nj, "majority": maj,
+            "dataset": it["dataset"], "id": it["id"], "intent": it["intent"], "intent_idx": it["intent_idx"],
+            "turns": len(it["turns"]), "votes": votes, "judge": it["judge"], "judge_reason": it["judge_reason"],
+            "jailbreak": jb, "not_jailbreak": nj, "majority": m,
             "human_disagreement": bool(jb and nj),
             "human_agreement": (max(jb, nj) / len(vals)) if vals else None,
-            "judge_differs": bool(it["judge"] and maj and maj != it["judge"]),
-            "judge_vs_split": bool(it["judge"] and jb and nj),
+            "judge_differs": bool(it["judge"] and m and m != it["judge"]),
         })
 
-    # each human vs judge
+    # every reviewer with any label at all (so test users with stray labels can still be deleted)
+    totals, last = Counter(r["reviewer"] for r in rows), {}
+    for r in rows:
+        last[r["reviewer"]] = max(last.get(r["reviewer"], 0), r["updated_at"])
     reviewers = []
-    for n in names:
-        v = by_reviewer[n]
+    for n in sorted(totals, key=str.casefold):
+        v = by_reviewer.get(n, {})
         st = kappa_pair(v, judge)
-        reviewers.append({"name": n, "done": len(v), "last": last[n],
+        reviewers.append({"name": n, "done": len(v), "last": last[n], "labels_all": totals[n],
                           "jailbreak": sum(x == "jailbreak" for x in v.values()),
                           "not_jailbreak": sum(x == "not_jailbreak" for x in v.values()),
                           "judge_n": st["n"], "judge_agree": st["agree"], "judge_kappa": st["kappa"]})
@@ -264,13 +452,13 @@ def summary(rows):
                    "mean_agree": (sum(p["agree"] * p["n"] for p in hh) / sum(p["n"] for p in hh)) if hh else None,
                    "mean_kappa": (sum(ks) / len(ks)) if ks else None}
 
-    # judge vs human majority (ties excluded), humans' majority treated as reference
-    maj = {x["id"]: x["majority"] for x in sessions if x["majority"]}
+    # judge vs human majority (ties excluded); the human majority is the reference
     jm = kappa_pair(judge, maj)
-    tp = sum(judge[k] == "jailbreak" and m == "jailbreak" for k, m in maj.items() if k in judge)
-    fp = sum(judge[k] == "jailbreak" and m == "not_jailbreak" for k, m in maj.items() if k in judge)
-    fn = sum(judge[k] == "not_jailbreak" and m == "jailbreak" for k, m in maj.items() if k in judge)
-    tn = sum(judge[k] == "not_jailbreak" and m == "not_jailbreak" for k, m in maj.items() if k in judge)
+    both = [(judge[k], m) for k, m in maj.items() if k in judge]
+    tp = sum(j == "jailbreak" and m == "jailbreak" for j, m in both)
+    fp = sum(j == "jailbreak" and m == "not_jailbreak" for j, m in both)
+    fn = sum(j == "not_jailbreak" and m == "jailbreak" for j, m in both)
+    tn = sum(j == "not_jailbreak" and m == "not_jailbreak" for j, m in both)
     judge_vs_majority = {**jm, "tp": tp, "fp": fp, "fn": fn, "tn": tn,
                          "precision": tp / (tp + fp) if tp + fp else None,
                          "recall": tp / (tp + fn) if tp + fn else None}
@@ -278,8 +466,9 @@ def summary(rows):
     # per-intent breakdown
     intents = {}
     for x in sessions:
-        d = intents.setdefault(x["intent"], {"intent": x["intent"], "sessions": 0, "labelled": 0, "judge_n": 0,
-                                             "judge_agree": 0, "human_split": 0})
+        d = intents.setdefault((x["dataset"], x["intent_idx"]), {
+            "dataset": x["dataset"], "intent_idx": x["intent_idx"], "intent": x["intent"], "sessions": 0,
+            "labelled": 0, "judge_n": 0, "judge_agree": 0, "human_split": 0})
         d["sessions"] += 1
         d["labelled"] += bool(x["votes"])
         d["human_split"] += x["human_disagreement"]
@@ -288,32 +477,44 @@ def summary(rows):
             d["judge_agree"] += x["judge"] == x["majority"]
 
     return {
-        "total_sessions": len(ITEMS), "total_labels": len(rows),
+        "dataset": dataset,
+        "datasets": [{"id": d["id"], "sessions": len(d["items"])} for d in DATASETS.values()],
+        "total_sessions": len(items), "total_labels": len(valid), "ignored_labels": len(in_sel) - len(valid),
         "sessions_with_judge": len(judge),
         "sessions_fully_covered": sum(len(x["votes"]) == len(names) for x in sessions) if names else 0,
         "sessions_with_split": sum(x["human_disagreement"] for x in sessions),
-        "reviewers": reviewers, "raters": raters, "pair": pair,
+        "reviewers": reviewers, "humans": names, "raters": raters, "pair": pair,
         "human_human": human_human, "judge_vs_majority": judge_vs_majority,
         "sessions": sessions, "intents": list(intents.values()),
     }
 
 
 def main():
-    global DB_PATH, ITEMS, ITEM_BY_ID, ADMIN_TOKEN
+    global DB_PATH, DATASETS, ITEMS, ITEM_BY_KEY, ADMIN_TOKEN
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--data", default=str(BASE / "data.json"))
+    ap.add_argument("--data", nargs="+", default=[str(BASE / "data.json"), str(BASE / "datasets")],
+                    help="data files and/or directories of *.json files (each file is one dataset)")
     ap.add_argument("--db", default=str(DB_PATH))
     a = ap.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # show startup/migration messages in `docker logs`
 
     DB_PATH = Path(a.db)
-    ITEMS = load_items(a.data)
-    ITEM_BY_ID = {i["id"]: i for i in ITEMS}
+    print("Loading data:")
+    for f in discover(a.data):
+        if f.stem in DATASETS:
+            fail(f"two data files are named {f.stem!r} ({DATASETS[f.stem]['file']} and {f.name}); rename one")
+        DATASETS[f.stem] = load_dataset(f)
+        print(f"  {f}: dataset {f.stem!r}, {len(DATASETS[f.stem]['items'])} sessions")
+    if not DATASETS:
+        raise SystemExit("No data files found. Pass --data <file.json|directory> (see format.md).")
+    ITEMS = [it for d in DATASETS.values() for it in d["items"]]
+    ITEM_BY_KEY = {(it["dataset"], it["id"]): it for it in ITEMS}
+
     ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN") or secrets.token_urlsafe(12)
     init_db()
 
-    print(f"Loaded {len(ITEMS)} sessions from {a.data}")
     if not os.environ.get("ADMIN_TOKEN"):
         print(f"ADMIN_TOKEN not set; generated one for this run: {ADMIN_TOKEN}")
     print(f"Reviewers: http://{a.host}:{a.port}/   Admin: http://{a.host}:{a.port}/admin")

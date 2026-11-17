@@ -91,3 +91,18 @@ json.dump(data, open("data.json", "w", encoding="utf-8"), ensure_ascii=False, in
 Start the app (`python3 app.py`). On startup it prints `Loaded N sessions`. If the file is malformed JSON, missing a field, or has duplicate ids, it exits with an error instead.
 
 After changing `data.json` on the deployed server, restart the container: `docker compose restart judge`.
+
+## Multiple data files (datasets)
+
+Every `*.json` file is its own **dataset**, named after the file (`data.json` → `data`, `round2.json` → `round2`). Reviewers pick a dataset after entering their name, and the admin page can show one dataset or all of them.
+
+- Put extra files in the `datasets/` folder next to `compose.yaml` (mounted at `/app/datasets`), or pass them explicitly: `python3 app.py --data data.json more.json folder/`.
+- `data.json` keeps working exactly as before; `datasets/` is optional.
+- Session ids only need to be unique **within a file**. The same id in two files is fine; they are different sessions.
+- File names must be unique (`data.json` and `datasets/data.json` clash and stop the app with an error).
+- **Don't rename a file once reviewers have labelled it.** Labels are stored against the dataset name (the file name without `.json`).
+- Files are read at startup: restart the container after adding or editing one.
+
+## Upgrading an existing deployment
+
+Pull/rebuild the image and restart. On first start the app upgrades `results.db` in place: every existing label is attached to the dataset containing its session id (ambiguous ones go to `data`), after saving a copy as `results.db.bak-pre-datasets` in the same volume. Nothing needs to be done by hand, and the old `data.json` mount keeps working. To roll back to the old image, restore that backup file.
