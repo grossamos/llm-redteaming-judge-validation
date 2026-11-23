@@ -71,10 +71,23 @@
     <div class="card">
       <div class="row">
         <label class="muted">Dataset <select id="dsSel"></select></label>
+        <label class="muted" title="Lock every reviewer to one dataset (others are hidden and they jump straight in)">Reviewers review <select id="activeSel"></select></label>
         <button id="refresh">Refresh</button>
         <button id="csv">Download CSV</button>
         <span id="totals" class="muted"></span>
       </div>
+      <div id="activeNote" class="muted" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Jailbreak definition <span class="muted">(shown to reviewers before they start)</span></h2>
+      <textarea id="defText" rows="8" maxlength="5000" style="width:100%;font:inherit;padding:10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:inherit"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button id="defSave" class="primary">Save definition</button>
+        <button id="defReset">Reset to default</button>
+        <span id="defStatus" class="muted"></span>
+      </div>
+      <p class="muted" style="margin-bottom:0">Plain text. Separate paragraphs with a blank line; start lines with <code>1.</code> for a numbered list or <code>-</code> for bullets; wrap text in <code>**double asterisks**</code> for bold. Changes apply immediately to everyone.</p>
     </div>
 
     <div class="card"><h2>Overview</h2><div class="stats" id="stats"></div>
@@ -183,6 +196,8 @@ async function openIntent(dataset, index, highlightId) {
       const row = el('div', 'vote');
       const cls = !x.judge ? '' : v.verdict === x.judge ? 'ok' : 'jb';
       row.append(el('b', cls, `${v.reviewer}: ${lab(v.verdict)}`));
+      if (v.prompt_echo != null || v.uplift != null)
+        row.append(el('span', 'muted', `echo: ${v.prompt_echo ? 'yes' : 'no'} · uplift: ${v.uplift ? 'yes' : 'no'}`));
       if (v.note) row.append(el('span', 'muted', '“' + v.note + '”'));
       votes.append(row);
     });
@@ -218,6 +233,13 @@ function render() {
   if (multi) s.datasets.forEach(d => sel.append(new Option(`${d.id} (${d.sessions})`, d.id)));
   sel.value = s.dataset || ''; sel.disabled = !multi;
 
+  const as = $('activeSel'); as.replaceChildren();
+  as.append(new Option('everyone chooses', ''));
+  s.datasets.forEach(d => as.append(new Option(d.id, d.id)));
+  as.value = s.active_dataset || '';
+  $('activeNote').textContent = s.active_dataset
+    ? `All reviewers currently go straight to “${s.active_dataset}”; the other datasets are hidden from them.` : '';
+
   $('stats').replaceChildren(
     stat(kap(jm.kappa), `κ judge vs human majority (n=${jm.n})`),
     stat(pct(jm.agree), 'judge agrees with human majority'),
@@ -227,6 +249,8 @@ function render() {
     stat(pct(hh.mean_agree), 'mean human–human agreement'),
     stat(`${s.sessions_with_split}`, 'sessions where humans split'),
     stat(`${s.sessions_fully_covered}/${s.total_sessions}`, 'sessions reviewed by everyone'),
+    stat(`${s.echo_flagged}`, `labels flagged as prompt echo (of ${s.flags_recorded} with flags recorded)`),
+    stat(`${s.jb_without_uplift}`, 'jailbreak labels marked “no uplift” (contradicts the definition)'),
   );
 
   // pairwise matrix
@@ -281,12 +305,24 @@ function render() {
       { v: i.judge_n ? `${i.judge_agree}/${i.judge_n} (${pct(i.judge_agree / i.judge_n)})` : '–', cls: 'n' }]));
 }
 
+async function loadDef() {
+  try { $('defText').value = (await (await fetch('/api/definition')).json()).text; } catch {}
+}
+async function saveDef(text, msg) {
+  try {
+    const j = await (await req('/api/admin/set-definition', { text })).json();
+    $('defText').value = j.text; $('defStatus').textContent = msg;
+  } catch (e) { $('defStatus').textContent = 'Failed: ' + e.message; }
+}
+$('defSave').onclick = () => saveDef($('defText').value, 'Saved ✓');
+$('defReset').onclick = () => { if (confirm('Replace the definition with the default text?')) saveDef('', 'Reset to default ✓'); };
+
 async function load() {
   try {
     data = await (await req('/api/admin/summary?' + q({ dataset: dsel }))).json();
     if (dsel && data.dataset !== dsel) dsel = '';
     $('auth').hidden = true; $('out').hidden = false;
-    render();
+    render(); loadDef();
     try { sessionStorage.setItem('tok', token); sessionStorage.setItem('ds', dsel); } catch {}
   } catch (e) { $('auth').hidden = false; $('out').hidden = true; $('err').textContent = e.message; }
 }
@@ -295,6 +331,10 @@ $('go').onclick = () => { token = $('tok').value; load(); };
 $('tok').onkeydown = e => { if (e.key === 'Enter') $('go').click(); };
 $('refresh').onclick = load;
 $('dsSel').onchange = () => { dsel = $('dsSel').value; load(); };
+$('activeSel').onchange = async () => {
+  try { await req('/api/admin/set-active', { dataset: $('activeSel').value }); } catch (e) { alert(e.message); }
+  load();
+};
 ['fDis', 'fJudge', 'fMissing'].forEach(id => $(id).onchange = () => data && render());
 $('csv').onclick = async () => {
   const b = await (await req('/api/admin/export.csv?' + q({ dataset: dsel }))).blob();
