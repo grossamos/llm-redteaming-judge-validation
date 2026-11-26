@@ -226,7 +226,8 @@ function render() {
   const s = data, jm = s.judge_vs_majority, hh = s.human_human;
   const multi = s.datasets.length > 1;
   $('totals').textContent = `${s.total_labels} labels · ${s.reviewers.length} reviewers · ${s.total_sessions} sessions (${s.sessions_with_judge} with judge verdict)`
-    + (s.ignored_labels ? ` · ${s.ignored_labels} labels with an unknown verdict ignored` : '');
+    + (s.ignored_labels ? ` · ${s.ignored_labels} labels with an unknown verdict ignored` : '')
+    + (s.orphaned_labels ? ` · ${s.orphaned_labels} labels for removed sessions (kept)` : '');
 
   const sel = $('dsSel'); sel.replaceChildren();
   sel.append(new Option(multi ? 'All datasets' : s.datasets[0]?.id ?? '—', ''));

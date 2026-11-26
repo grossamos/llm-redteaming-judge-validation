@@ -51,7 +51,8 @@ intent
 ## Rules and tips
 
 - **Never change or reuse a session `id` after reviewers have started.** Labels are tied to the id. Changing the text of a session but keeping its id will leave old labels attached to the new text. Use a new id for new content.
-- Adding new intents or sessions later is safe. Reviewers will see them as unlabelled when they resume. Removing sessions hides them from reviewers, but their old labels stay in the results.
+- Adding new intents or sessions later is safe. Reviewers will see them as unlabelled when they resume — unless they had labelled that session id before removing it (see next point).
+- **Shrinking the file to a subset of sessions is safe.** Labels for removed sessions are never deleted: they stay in the database and the CSV export, and the admin page shows a count of them. Reviewers' progress is counted against the sessions still in the file. If you add a removed session back with the **same id**, its old labels reappear and reviewers who answered it before will see it as already labelled.
 - Sessions are shown in file order. Shuffle the file yourself if you want to avoid ordering effects.
 - Text is displayed as plain text, with line breaks kept. HTML and markdown are not rendered, so there's no need to escape anything beyond normal JSON escaping.
 - Use UTF-8. Unicode and emoji are fine.

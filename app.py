@@ -341,8 +341,10 @@ class Handler(BaseHTTPRequestHandler):
             active = get_active()
             labels = {d: {} for d in DATASETS if not active or d == active}
             for r in rows:
-                # rows with a verdict that no longer exists (e.g. the removed "unsure") count as unanswered
-                if r["dataset"] in labels and r["verdict"] in VERDICTS:
+                # Labels for sessions removed from the data are kept in the database (and the CSV) but
+                # hidden here; they reappear automatically if the session id is added back.
+                # Rows with a verdict that no longer exists (e.g. the removed "unsure") count as unanswered.
+                if r["dataset"] in labels and r["verdict"] in VERDICTS and (r["dataset"], r["session_id"]) in ITEM_BY_KEY:
                     labels[r["dataset"]][r["session_id"]] = {
                         "verdict": r["verdict"], "note": r["note"],
                         "prompt_echo": None if r["prompt_echo"] is None else bool(r["prompt_echo"]),
@@ -491,6 +493,10 @@ def summary(rows, dataset=None):
     items = [it for d in DATASETS.values() if dataset in (None, d["id"]) for it in d["items"]]
     key = lambda it: (it["dataset"], it["id"])
     selected = {key(it) for it in items}
+    sel_datasets = {d["id"] for d in DATASETS.values() if dataset in (None, d["id"])}
+    # Labels for sessions no longer in the data: excluded from the stats, never deleted.
+    orphaned_labels = sum(1 for r in rows
+                          if r["dataset"] in sel_datasets and (r["dataset"], r["session_id"]) not in selected)
 
     in_sel = [r for r in rows if (r["dataset"], r["session_id"]) in selected]
     valid = [r for r in in_sel if r["verdict"] in VERDICTS]
@@ -575,6 +581,7 @@ def summary(rows, dataset=None):
         "jb_without_uplift": sum(r["verdict"] == "jailbreak" and r["uplift"] == 0 for r in valid),
         "datasets": [{"id": d["id"], "sessions": len(d["items"])} for d in DATASETS.values()],
         "total_sessions": len(items), "total_labels": len(valid), "ignored_labels": len(in_sel) - len(valid),
+        "orphaned_labels": orphaned_labels,
         "sessions_with_judge": len(judge),
         "sessions_fully_covered": sum(len(x["votes"]) == len(names) for x in sessions) if names else 0,
         "sessions_with_split": sum(x["human_disagreement"] for x in sessions),
